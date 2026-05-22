@@ -1,0 +1,291 @@
+{
+  "name": "Ministry DocGen v2 - Smart Research + DOCX",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "generate-doc",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "webhookId": "ministry-docgen-v2"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Validate and normalize incoming request\nconst body = $input.first().json.body;\n\nif (!body.inputs || !Array.isArray(body.inputs) || body.inputs.length === 0) {\n  throw new Error('inputs array is required. Each item: { query: string } — can be LinkedIn URL, name, or company');\n}\nif (!body.meeting_date) throw new Error('meeting_date is required');\nif (!body.uzbek_participants || !Array.isArray(body.uzbek_participants)) throw new Error('uzbek_participants array is required');\nif (!body.user_id) throw new Error('user_id (Telegram ID) is required');\n\nconst docId = `doc_${Date.now()}_${body.user_id}`;\n\nreturn [{\n  json: {\n    inputs: body.inputs,\n    meeting_date: body.meeting_date,\n    meeting_time: body.meeting_time || '11:00',\n    uzbek_participants: body.uzbek_participants,\n    user_id: body.user_id,\n    doc_id: docId\n  }\n}];"
+      },
+      "id": "validate-input",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Split inputs array into individual items for parallel research\nconst data = $input.first().json;\n\nreturn data.inputs.map((item, index) => ({\n  json: {\n    query: item.query,\n    index: index,\n    total: data.inputs.length,\n    meeting_date: data.meeting_date,\n    meeting_time: data.meeting_time,\n    uzbek_participants: data.uzbek_participants,\n    user_id: data.user_id,\n    doc_id: data.doc_id\n  }\n}));"
+      },
+      "id": "split-inputs",
+      "name": "Split Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3002/research",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: $json.query }) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "research-api",
+      "name": "Research API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 300],
+      "notes": "Calls our custom research API — handles LinkedIn URL, name, company, anything"
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Validate research result and merge with metadata\nconst research = $input.first().json;\nconst meta = $('Split Inputs').first().json;\n\nif (!research.success) {\n  throw new Error(`Research failed for \"${meta.query}\": ${research.error}`);\n}\n\nif (!research.person || !research.person.full_name) {\n  throw new Error(`Could not extract person data for \"${meta.query}\"`);\n}\n\nreturn [{\n  json: {\n    index: meta.index,\n    total: meta.total,\n    meeting_date: meta.meeting_date,\n    meeting_time: meta.meeting_time,\n    uzbek_participants: meta.uzbek_participants,\n    user_id: meta.user_id,\n    doc_id: meta.doc_id,\n    query: meta.query,\n    person: research.person,\n    company_info: research.company_info,\n    education: research.education || [],\n    career: research.career || [],\n    confidence: research.person.confidence || 'medium'\n  }\n}];"
+      },
+      "id": "validate-research",
+      "name": "Validate Research",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 300]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all researched profiles into one document\nconst items = $input.all();\n\n// Group by doc_id\nconst grouped = {};\nfor (const item of items) {\n  const docId = item.json.doc_id;\n  if (!grouped[docId]) {\n    grouped[docId] = {\n      doc_id: docId,\n      user_id: item.json.user_id,\n      meeting_date: item.json.meeting_date,\n      meeting_time: item.json.meeting_time,\n      uzbek_participants: item.json.uzbek_participants,\n      profiles: []\n    };\n  }\n  grouped[docId].profiles.push({\n    index: item.json.index,\n    query: item.json.query,\n    person: item.json.person,\n    company_info: item.json.company_info,\n    education: item.json.education,\n    career: item.json.career,\n    confidence: item.json.confidence\n  });\n}\n\n// Sort by original index\nfor (const docId in grouped) {\n  grouped[docId].profiles.sort((a, b) => a.index - b.index);\n}\n\nreturn Object.values(grouped).map(doc => ({ json: doc }));"
+      },
+      "id": "aggregate-profiles",
+      "name": "Aggregate Profiles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 300]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Build final document structure for DOCX service\nconst data = $input.first().json;\nconst profiles = data.profiles;\n\nconst docStructure = {\n  doc_id: data.doc_id,\n  meeting_date: data.meeting_date,\n  meeting_time: data.meeting_time,\n  uzbek_participants: data.uzbek_participants,\n  sections: []\n};\n\n// Build all foreign participants list (for participants table)\nconst foreignParticipants = profiles.map(p => ({\n  name: p.person.full_name,\n  position: p.person.position,\n  company: p.person.company\n}));\n\nfor (let i = 0; i < profiles.length; i++) {\n  const p = profiles[i];\n\n  // 1. Company Info Page\n  docStructure.sections.push({\n    type: 'company_info',\n    company_name: p.company_info.name,\n    description: p.company_info.description,\n    uzbekistan_connection: p.company_info.uzbekistan_connection,\n    activity_title: p.company_info.activity_title,\n    activity_description: p.company_info.activity_description\n  });\n\n  // 2. Participants Table (only once, after first company info)\n  if (i === 0) {\n    docStructure.sections.push({\n      type: 'participants_table',\n      meeting_date: data.meeting_date,\n      meeting_time: data.meeting_time,\n      uzbek_participants: data.uzbek_participants,\n      foreign_participants: foreignParticipants\n    });\n  }\n\n  // 3. Bio Page\n  docStructure.sections.push({\n    type: 'bio',\n    full_name: p.person.full_name,\n    position: p.person.position,\n    company: p.person.company,\n    education: p.education,\n    career: p.career\n  });\n}\n\nreturn [{ json: docStructure }];"
+      },
+      "id": "build-doc-structure",
+      "name": "Build Document Structure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 300]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3001/generate-docx",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "docx-service",
+      "name": "DOCX Generator Service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 300]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/storage/v1/object/documents/{{ $('Build Document Structure').first().json.doc_id }}.docx",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            },
+            {
+              "name": "x-upsert",
+              "value": "true"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "value": "={{ Buffer.from($json.file_base64, 'base64') }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "upload-supabase",
+      "name": "Upload to Supabase Storage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1960, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Supabase API"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/documents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  doc_id: $('Build Document Structure').first().json.doc_id,\n  user_id: $('Build Document Structure').first().json.user_id,\n  download_url: $env.SUPABASE_URL + '/storage/v1/object/public/documents/' + $('Build Document Structure').first().json.doc_id + '.docx',\n  meeting_date: $('Build Document Structure').first().json.meeting_date,\n  profiles_count: $('Build Document Structure').first().json.sections.filter(s => s.type === 'bio').length,\n  queries: $('Aggregate Profiles').first().json.profiles.map(p => p.query),\n  created_at: new Date().toISOString()\n}) }}",
+        "options": {}
+      },
+      "id": "save-to-db",
+      "name": "Save to Supabase DB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2180, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Supabase API"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  success: true,\n  doc_id: $('Build Document Structure').first().json.doc_id,\n  download_url: $env.SUPABASE_URL + '/storage/v1/object/public/documents/' + $('Build Document Structure').first().json.doc_id + '.docx',\n  meeting_date: $('Build Document Structure').first().json.meeting_date,\n  profiles_count: $('Build Document Structure').first().json.sections.filter(s => s.type === 'bio').length,\n  message: 'Документ успешно сгенерирован'\n}) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" }
+            ]
+          }
+        }
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2400, 300]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  success: false,\n  error: $json.message || 'Ошибка при генерации документа',\n  doc_id: null\n}) }}",
+        "options": {
+          "responseCode": 500,
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" }
+            ]
+          }
+        }
+      },
+      "id": "respond-error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2400, 500]
+    },
+
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [2180, 500]
+    }
+  ],
+
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]]
+    },
+    "Validate Input": {
+      "main": [[{ "node": "Split Inputs", "type": "main", "index": 0 }]]
+    },
+    "Split Inputs": {
+      "main": [[{ "node": "Research API", "type": "main", "index": 0 }]]
+    },
+    "Research API": {
+      "main": [[{ "node": "Validate Research", "type": "main", "index": 0 }]]
+    },
+    "Validate Research": {
+      "main": [[{ "node": "Aggregate Profiles", "type": "main", "index": 0 }]]
+    },
+    "Aggregate Profiles": {
+      "main": [[{ "node": "Build Document Structure", "type": "main", "index": 0 }]]
+    },
+    "Build Document Structure": {
+      "main": [[{ "node": "DOCX Generator Service", "type": "main", "index": 0 }]]
+    },
+    "DOCX Generator Service": {
+      "main": [[{ "node": "Upload to Supabase Storage", "type": "main", "index": 0 }]]
+    },
+    "Upload to Supabase Storage": {
+      "main": [[{ "node": "Save to Supabase DB", "type": "main", "index": 0 }]]
+    },
+    "Save to Supabase DB": {
+      "main": [[{ "node": "Respond Success", "type": "main", "index": 0 }]]
+    },
+    "Error Handler": {
+      "main": [[{ "node": "Respond Error", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+
+  "tags": ["ministry", "docgen", "v2", "research-api"]
+}
